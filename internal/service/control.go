@@ -294,32 +294,59 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 	if !ok {
 		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
 	}
-	if current.State == model.StateLaunched {
-		if err := run.Track(r.Runs, runID); err != nil {
-			return model.OperationRecord{}, err
-		}
-	}
+	transitionToTracking := current.State == model.StateLaunched
 	if request.ObservedAt.IsZero() {
 		request.ObservedAt = time.Now().UTC()
 	}
 	if request.Kind == "" {
 		request.Kind = tracker.SourceMagnetic
 	}
-	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
-	if err := r.Lineage.Add(tracker.SourceObservation{
+
+	// Validate the full write before publishing anything. The run must not
+	// enter tracking and the point must not be recorded when the position or
+	// the source observation would be rejected.
+	generation := r.Tracker.Generation(runID)
+	observation := tracker.SourceObservation{
 		RunID:            runID,
 		StationID:        request.StationID,
 		ObservationID:    model.NewRevision(),
 		PhysicalSourceID: request.SourceID,
 		Kind:             request.Kind,
 		Position:         request.Position,
-		Generation:       evidence.Generation,
+		Generation:       generation,
 		ObservedAt:       request.ObservedAt,
 		Valid:            true,
-	}); err != nil {
+	}
+	if err := r.Lineage.Validate(observation); err != nil {
 		return model.OperationRecord{}, err
 	}
+	if err := r.Routes.CanAdvance(runID, request.Position); err != nil {
+		r.recordIncident(runID, "warning", err.Error())
+		return model.OperationRecord{}, err
+	}
+
+	// All checks passed: publish the state changes in order, rolling back the
+	// earlier writes if any later step fails so no partial state survives.
+	if transitionToTracking {
+		if err := run.Track(r.Runs, runID); err != nil {
+			return model.OperationRecord{}, err
+		}
+	}
+	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
+	if err := r.Lineage.Add(observation); err != nil {
+		r.Tracker.Retract(evidence)
+		if transitionToTracking {
+			run.Restore(r.Runs, []model.Run{current})
+		}
+		return model.OperationRecord{}, err
+	}
+	priorPosition := r.Routes.Position(runID)
 	if err := r.Routes.Advance(runID, request.Position); err != nil {
+		r.Lineage.Remove(observation.ObservationID)
+		r.Tracker.Retract(evidence)
+		if transitionToTracking {
+			run.Restore(r.Runs, []model.Run{current})
+		}
 		r.recordIncident(runID, "warning", err.Error())
 		return model.OperationRecord{}, err
 	}
@@ -343,9 +370,31 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 		Payload: fmt.Sprintf("%s/%s/%.3f", request.StationID, request.SourceID, request.Position),
 		At:      request.ObservedAt,
 	}); err != nil {
+		r.rollbackTracking(runID, transitionToTracking, current, observation.ObservationID, evidence, priorPosition)
 		return model.OperationRecord{}, err
 	}
 	return r.Operation(runID)
+}
+
+// rollbackTracking reverses every tracking write published by Track, in the
+// reverse order, after a late failure (e.g. the durable journal rejected the
+// event).
+func (r *Runtime) rollbackTracking(runID string, transitioned bool, previousRun model.Run, observationID string, evidence model.PassageEvidence, priorPosition float64) {
+	r.mu.Lock()
+	if points := r.control.Tracking[runID]; len(points) > 0 {
+		r.control.Tracking[runID] = points[:len(points)-1]
+		if len(r.control.Tracking[runID]) == 0 {
+			delete(r.control.Tracking, runID)
+		}
+	}
+	r.control.Revision = model.NewRevision()
+	r.mu.Unlock()
+	r.Routes.RestoreProgress(runID, priorPosition)
+	r.Lineage.Remove(observationID)
+	r.Tracker.Retract(evidence)
+	if transitioned {
+		run.Restore(r.Runs, []model.Run{previousRun})
+	}
 }
 
 func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, error) {

@@ -21,6 +21,39 @@ func (c *Coordinator) Observe(runID, station, source string, position float64, a
 	c.sources[key][source] = true
 	return e
 }
+
+// Retract removes an evidence point previously stored by Observe so that a
+// tracking point rejected by a later validation never remains in the source
+// records. Only an exact match is removed; the source index is rebuilt to
+// drop the source when no remaining point references it.
+func (c *Coordinator) Retract(e model.PassageEvidence) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := e.RunID + "/" + e.Station
+	points := c.points[key]
+	for i := len(points) - 1; i >= 0; i-- {
+		if points[i] == e {
+			c.points[key] = append(points[:i], points[i+1:]...)
+			break
+		}
+	}
+	if len(c.points[key]) == 0 {
+		delete(c.points, key)
+	}
+	set, ok := c.sources[key]
+	if !ok {
+		return
+	}
+	for _, remaining := range c.points[key] {
+		if remaining.SourceID == e.SourceID {
+			return
+		}
+	}
+	delete(set, e.SourceID)
+	if len(set) == 0 {
+		delete(c.sources, key)
+	}
+}
 func (c *Coordinator) Revise(runID string) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()

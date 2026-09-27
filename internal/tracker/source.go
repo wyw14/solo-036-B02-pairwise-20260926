@@ -44,6 +44,20 @@ func NewSourceLineage() *SourceLineage {
 }
 
 func (l *SourceLineage) Add(observation SourceObservation) error {
+	if err := l.Validate(observation); err != nil {
+		return err
+	}
+	if observation.ParentObservationID != "" {
+		l.children[observation.ParentObservationID] = append(l.children[observation.ParentObservationID], observation.ObservationID)
+	}
+	l.observations[observation.ObservationID] = observation
+	return nil
+}
+
+// Validate reports whether Add would accept the observation, without
+// modifying the lineage. Callers validate before publishing tracking state so
+// a rejected point leaves no partial records.
+func (l *SourceLineage) Validate(observation SourceObservation) error {
 	if strings.TrimSpace(observation.ObservationID) == "" {
 		return errors.New("observation id is required")
 	}
@@ -81,10 +95,32 @@ func (l *SourceLineage) Add(observation SourceObservation) error {
 		if parent.Generation != observation.Generation {
 			return errors.New("derived observation changes generation")
 		}
-		l.children[parent.ObservationID] = append(l.children[parent.ObservationID], observation.ObservationID)
 	}
-	l.observations[observation.ObservationID] = observation
 	return nil
+}
+
+// Remove deletes an observation previously accepted by Add and detaches it
+// from its parent's lineage. It is used to roll back a tentative tracking
+// write when a later validation rejects the point.
+func (l *SourceLineage) Remove(observationID string) {
+	observation, ok := l.observations[observationID]
+	if !ok {
+		return
+	}
+	if observation.ParentObservationID != "" {
+		siblings := l.children[observation.ParentObservationID]
+		for i, childID := range siblings {
+			if childID == observationID {
+				l.children[observation.ParentObservationID] = append(siblings[:i], siblings[i+1:]...)
+				break
+			}
+		}
+		if len(l.children[observation.ParentObservationID]) == 0 {
+			delete(l.children, observation.ParentObservationID)
+		}
+	}
+	delete(l.children, observationID)
+	delete(l.observations, observationID)
 }
 
 func (l *SourceLineage) Observations(runID, stationID string, generation int64) []SourceObservation {
