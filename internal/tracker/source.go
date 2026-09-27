@@ -87,6 +87,30 @@ func (l *SourceLineage) Add(observation SourceObservation) error {
 	return nil
 }
 
+// Remove discards a previously accepted observation and detaches it from its
+// parent. It is the compensating action used when later validation rejects an
+// observation that Add already accepted.
+func (l *SourceLineage) Remove(observationID string) {
+	observation, ok := l.observations[observationID]
+	if !ok {
+		return
+	}
+	if observation.ParentObservationID != "" {
+		siblings := l.children[observation.ParentObservationID]
+		for i, id := range siblings {
+			if id == observationID {
+				l.children[observation.ParentObservationID] = append(siblings[:i], siblings[i+1:]...)
+				break
+			}
+		}
+		if len(l.children[observation.ParentObservationID]) == 0 {
+			delete(l.children, observation.ParentObservationID)
+		}
+	}
+	delete(l.children, observationID)
+	delete(l.observations, observationID)
+}
+
 func (l *SourceLineage) Observations(runID, stationID string, generation int64) []SourceObservation {
 	out := make([]SourceObservation, 0)
 	for _, observation := range l.observations {

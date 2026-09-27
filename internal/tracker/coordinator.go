@@ -21,6 +21,27 @@ func (c *Coordinator) Observe(runID, station, source string, position float64, a
 	c.sources[key][source] = true
 	return e
 }
+func (c *Coordinator) Remove(runID, station string, target model.PassageEvidence) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := runID + "/" + station
+	points := c.points[key]
+	for i, e := range points {
+		if e == target {
+			c.points[key] = append(points[:i], points[i+1:]...)
+			break
+		}
+	}
+	sources := make(map[string]bool)
+	for _, e := range c.points[key] {
+		sources[e.SourceID] = true
+	}
+	if len(sources) == 0 {
+		delete(c.sources, key)
+	} else {
+		c.sources[key] = sources
+	}
+}
 func (c *Coordinator) Revise(runID string) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()

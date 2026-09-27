@@ -132,14 +132,16 @@ func (r *Runtime) appendEvent(event model.Event) error {
 	if event.At.IsZero() {
 		event.At = time.Now().UTC()
 	}
-	if err := r.Journal.Append(event); err != nil {
-		return err
-	}
 	control := r.ensureControl()
 	if control.Persistent != nil {
+		// Persist before touching the in-memory journal so a durable-write
+		// failure leaves no partial event behind.
 		if err := control.Persistent.Append(event); err != nil {
 			return fmt.Errorf("persist event: %w", err)
 		}
+	}
+	if err := r.Journal.Append(event); err != nil {
+		return err
 	}
 	return nil
 }
@@ -294,22 +296,34 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 	if !ok {
 		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
 	}
-	if current.State == model.StateLaunched {
-		if err := run.Track(r.Runs, runID); err != nil {
-			return model.OperationRecord{}, err
-		}
-	}
 	if request.ObservedAt.IsZero() {
 		request.ObservedAt = time.Now().UTC()
 	}
 	if request.Kind == "" {
 		request.Kind = tracker.SourceMagnetic
 	}
+
+	// Validate the position against route progress before any state is
+	// published. An illegal position must leave the run, tracker and source
+	// lineage exactly as they were before the request.
+	if err := r.Routes.Check(runID, request.Position); err != nil {
+		r.recordIncident(runID, "warning", err.Error())
+		return model.OperationRecord{}, err
+	}
+
+	enteredTracking := current.State == model.StateLaunched
+	if enteredTracking {
+		if err := run.Track(r.Runs, runID); err != nil {
+			return model.OperationRecord{}, err
+		}
+	}
+
 	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
+	observationID := model.NewRevision()
 	if err := r.Lineage.Add(tracker.SourceObservation{
 		RunID:            runID,
 		StationID:        request.StationID,
-		ObservationID:    model.NewRevision(),
+		ObservationID:    observationID,
 		PhysicalSourceID: request.SourceID,
 		Kind:             request.Kind,
 		Position:         request.Position,
@@ -317,12 +331,20 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 		ObservedAt:       request.ObservedAt,
 		Valid:            true,
 	}); err != nil {
+		r.Tracker.Remove(runID, request.StationID, evidence)
+		if enteredTracking {
+			run.RevertTracking(r.Runs, runID)
+		}
 		return model.OperationRecord{}, err
 	}
+
+	previousPosition := r.Routes.Position(runID)
 	if err := r.Routes.Advance(runID, request.Position); err != nil {
+		r.discardTrackingPoint(runID, request.StationID, observationID, evidence, enteredTracking, previousPosition)
 		r.recordIncident(runID, "warning", err.Error())
 		return model.OperationRecord{}, err
 	}
+
 	state := model.TrackingState{
 		RunID:      runID,
 		StationID:  request.StationID,
@@ -343,9 +365,41 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 		Payload: fmt.Sprintf("%s/%s/%.3f", request.StationID, request.SourceID, request.Position),
 		At:      request.ObservedAt,
 	}); err != nil {
+		r.discardPublishedTracking(runID, state)
+		r.discardTrackingPoint(runID, request.StationID, observationID, evidence, enteredTracking, previousPosition)
 		return model.OperationRecord{}, err
 	}
 	return r.Operation(runID)
+}
+
+// discardTrackingPoint rolls back every partial write performed for a tracking
+// point that later validation rejected: route progress, source lineage,
+// tracker evidence and the run's launched -> tracking transition.
+func (r *Runtime) discardTrackingPoint(runID, stationID, observationID string, evidence model.PassageEvidence, enteredTracking bool, previousPosition float64) {
+	r.Routes.RevertProgress(runID, previousPosition)
+	r.Lineage.Remove(observationID)
+	r.Tracker.Remove(runID, stationID, evidence)
+	if enteredTracking {
+		run.RevertTracking(r.Runs, runID)
+	}
+}
+
+// discardPublishedTracking removes the in-memory tracking state appended for a
+// point whose journal event could not be durably recorded.
+func (r *Runtime) discardPublishedTracking(runID string, state model.TrackingState) {
+	r.mu.Lock()
+	points := r.control.Tracking[runID]
+	for i := len(points) - 1; i >= 0; i-- {
+		if points[i] == state {
+			r.control.Tracking[runID] = append(points[:i], points[i+1:]...)
+			break
+		}
+	}
+	if len(r.control.Tracking[runID]) == 0 {
+		delete(r.control.Tracking, runID)
+	}
+	r.control.Revision = model.NewRevision()
+	r.mu.Unlock()
 }
 
 func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, error) {
